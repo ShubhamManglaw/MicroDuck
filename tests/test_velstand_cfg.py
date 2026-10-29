@@ -118,7 +118,7 @@ def test_impact_thresholds_spare_quasi_static_pushoff():
 def test_warm_start_collapses_inherited_curricula_only():
     if not vs.WARM_START:
         pytest.skip("warm start disabled")
-    base = make_microduck_velocity_env_cfg()
+    base = make_microduck_velocity_env_cfg(straight_walk=False)  # velstand's walk layer
     cfg = vs.make_microduck_velstand_env_cfg()
     # body_pose_range is REPLACED by velstand's own body-control ramp (ENABLE_BODY_CONTROL)
     replaced = {"body_pose_range"} if vs.ENABLE_BODY_CONTROL else set()

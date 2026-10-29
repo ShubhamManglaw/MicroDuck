@@ -596,7 +596,9 @@ def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
 
 def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> ManagerBasedRlEnvCfg:
     # Walk layer: the PROVEN velocity recipe, verbatim.
-    cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
+    # straight_walk=False: velstand has its own yaw recipe (ENABLE_YAW_FIX /
+    # ENABLE_ANCHOR_YAW_REMAP, docs/velstand_policy.md) — keep it unconfounded.
+    cfg = make_microduck_velocity_env_cfg(play=play, rough=rough, straight_walk=False)
 
     # In play mode the curriculum doesn't run, so the fall-termination disable
     # below never fires — just delete the termination outright.

@@ -4767,8 +4767,10 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
         mag = torch.empty(len(turn_ids), device=self.device).uniform_(lo_frac * maxr, maxr)
         self.vel_command_b[turn_ids, 2] = sign * mag
         # These envs must actually turn — un-mark them as standing (which would
-        # zero the command) and refresh the world-frame reference copy.
+        # zero the command) or heading-hold (which would overwrite wz every step),
+        # and refresh the world-frame reference copy.
         self.is_standing_env[turn_ids] = False
+        self.is_heading_env[turn_ids] = False
         self.vel_command_w[turn_ids] = self.vel_command_b[turn_ids]
 
     def _debug_vis_impl(self, visualizer: "DebugVisualizer") -> None:
@@ -5472,6 +5474,56 @@ def track_yaw_rate_fine(
     asset: Entity = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_command(command_name)
     return torch.exp(-torch.square(cmd[:, 2] - asset.data.root_link_ang_vel_b[:, 2]) / std**2)
+
+
+def straight_walk_drift_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    tau_s: float = 2.0,
+    yaw_scale: float = 1.0,
+    lat_scale: float = 2.0,
+    max_cmd_yaw: float = 0.1,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize the time-averaged (DC) yaw-rate and lateral-velocity tracking error
+    while the command says "no turn": -(yaw_scale·|EMA(e_wz)| + lat_scale·|EMA(e_vy)|).
+    Self-negating (≤ 0) → POSITIVE weight.
+
+    Why (velocity run 2026-10-29_01-08-33_velocity4096): the policy curves when
+    walking a zero-yaw command. The stock track_angular_velocity cannot see it —
+    std 0.71 folds the roll/pitch rates stepping creates into the yaw error, so a
+    0.1 rad/s steady drift still scores 98% — and the policy has no heading in its
+    obs, so a small rate bias integrates into ~30° per 10 s. Tightening that
+    Gaussian is the head-droop trap again (see head_pose_bias_penalty): the
+    per-step yaw/lateral sway of a gait is unavoidable, the BIAS is escapable.
+    The EMA lets the step-to-step sway cancel and prices only the bias, so at the
+    optimum this costs a straight-walking policy nothing.
+
+    Gated to |cmd wz| ≤ ``max_cmd_yaw``: turning envs are left to the tracking
+    terms (velstand v8b: anything that taxes turn frames lost turning). The EMA
+    is reset on episode start and while gated off, so a turn that ends does not
+    bill its residual error to the straight segment that follows.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    err = torch.stack(
+        (
+            cmd[:, 1] - asset.data.root_link_lin_vel_b[:, 1],
+            cmd[:, 2] - asset.data.root_link_ang_vel_b[:, 2],
+        ),
+        dim=-1,
+    )
+    err = torch.nan_to_num(err, nan=0.0, posinf=0.0, neginf=0.0)
+    straight = cmd[:, 2].abs() <= max_cmd_yaw
+
+    if not hasattr(env, "_straight_drift_ema"):
+        env._straight_drift_ema = torch.zeros_like(err)
+    alpha = min(1.0, float(env.step_dt) / max(tau_s, 1e-6))
+    env._straight_drift_ema = (1.0 - alpha) * env._straight_drift_ema + alpha * err
+    reset = (env.episode_length_buf <= 1) | ~straight
+    env._straight_drift_ema[reset] = 0.0
+    ema = env._straight_drift_ema.abs()
+    return -(lat_scale * ema[:, 0] + yaw_scale * ema[:, 1]) * straight.float()
 
 
 def upright_body_cmd_relative(

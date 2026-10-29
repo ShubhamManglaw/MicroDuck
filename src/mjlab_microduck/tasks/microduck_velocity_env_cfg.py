@@ -24,6 +24,24 @@ NUM_STEPS_PER_ENV = 24
 # Fraction of envs commanded to spin on the spot (lin=0, |ang| ∈ [0.4·max, max]).
 TURN_IN_PLACE_FRACTION = 0.15
 
+# Straight walking (2026-10-29). Run 2026-10-29_01-08-33_velocity4096 curves on a
+# zero-yaw command: error_vel_yaw flat at ~1.0 from iter ~4000 to 11000, and the
+# stock yaw term (std 0.71, roll/pitch folded in) cannot see a 0.1 rad/s bias.
+# Three parts, none touching the 61D obs:
+#   - track_yaw_fine: yaw-only Gaussian (velstand v8b recipe, std 0.35, weight 2)
+#   - straight_walk_drift: L1 on a 2 s EMA of the wz / vy error, only while
+#     |cmd wz| ≤ 0.1 — prices the escapable bias, not the gait's sway
+#   - heading-hold envs: wz = k·heading_error (clipped to the wz range), the
+#     closed-loop correction a runtime heading hold sends. Still a RATE command,
+#     so policies stay hot-swappable.
+ENABLE_STRAIGHT_WALK = True
+TRACK_YAW_FINE_STD = 0.35
+TRACK_YAW_FINE_WEIGHT = 2.0
+STRAIGHT_DRIFT_TAU_S = 2.0
+STRAIGHT_DRIFT_MAX_CMD_YAW = 0.1  # rad/s; above this the env is turning, not drifting
+HEADING_ENVS_FRACTION = 0.2
+HEADING_CONTROL_STIFFNESS = 0.5   # rad/s per rad of heading error
+
 # Symmetry
 ENABLE_SYMMETRY = False
 
@@ -193,8 +211,13 @@ def _soften_terrain_contacts(spec: _mujoco.MjSpec) -> None:
 def make_microduck_velocity_env_cfg(
     play: bool = False,
     rough: bool = False,
+    straight_walk: bool = ENABLE_STRAIGHT_WALK,
 ) -> ManagerBasedRlEnvCfg:
-    """Create Microduck velocity tracking environment configuration."""
+    """Create Microduck velocity tracking environment configuration.
+
+    ``straight_walk``: add the straight-walking terms (see ENABLE_STRAIGHT_WALK).
+    Envs that build on this recipe with their own yaw setup (velstand) pass False.
+    """
 
     std_standing = {
         # Lower body — tighter to keep the robot in home pose when standing
@@ -744,6 +767,27 @@ def make_microduck_velocity_env_cfg(
         params={"command_name": "head_pose", "tau_s": 1.0},
     )
 
+    if straight_walk:
+        twist = cfg.commands["twist"]
+        twist.heading_command = True
+        twist.rel_heading_envs = HEADING_ENVS_FRACTION
+        twist.heading_control_stiffness = HEADING_CONTROL_STIFFNESS
+        twist.ranges.heading = (-math.pi, math.pi)
+        cfg.rewards["track_yaw_fine"] = RewardTermCfg(
+            func=microduck_mdp.track_yaw_rate_fine,
+            weight=TRACK_YAW_FINE_WEIGHT,
+            params={"std": TRACK_YAW_FINE_STD, "command_name": "twist"},
+        )
+        cfg.rewards["straight_walk_drift"] = RewardTermCfg(
+            func=microduck_mdp.straight_walk_drift_penalty,
+            weight=0.0,  # self-negating → positive; ramped by straight_walk_drift_weight
+            params={
+                "command_name": "twist",
+                "tau_s": STRAIGHT_DRIFT_TAU_S,
+                "max_cmd_yaw": STRAIGHT_DRIFT_MAX_CMD_YAW,
+            },
+        )
+
     # Terrain
     if not rough:
         cfg.scene.terrain.terrain_type = "plane"
@@ -905,6 +949,23 @@ def make_microduck_velocity_env_cfg(
             ],
         },
     )
+
+    # straight_walk_drift ramp: a precision tax, so OFF until a gait exists (same
+    # pacing as head_pose_bias). At weight 2.0 a 0.1 rad/s yaw drift costs
+    # 0.2/step and a 0.05 m/s lateral drift 0.2/step. A resumed run past iter 2000
+    # gets the final weight at once.
+    if straight_walk:
+        cfg.curriculum["straight_walk_drift_weight"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_weight,
+            params={
+                "reward_name": "straight_walk_drift",
+                "weight_stages": [
+                    {"step": 0, "weight": 0.0},
+                    {"step": 1500 * NUM_STEPS_PER_ENV, "weight": 1.0},
+                    {"step": 2000 * NUM_STEPS_PER_ENV, "weight": 2.0},
+                ],
+            },
+        )
 
     return cfg
 
